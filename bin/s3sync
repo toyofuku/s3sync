@@ -28,8 +28,8 @@ module S3sync
 
   require 's3sync'
 
-  $S3syncDirString = '{E40327BF-517A-46e8-A6C3-AF51BC263F59}'
-  $S3syncDirTag = 'd66759af42f282e1ba19144df2d405d0'
+  $S3syncDirString = ''
+  $S3syncDirTag = 'd41d8cd98f00b204e9800998ecf8427e'
   $S3syncDirFile = Tempfile.new("s3sync")
   $S3syncDirFile.puts $S3syncDirString
   $S3syncDirFile.close # not final; we need this file again to 'put' directory nodes
@@ -291,7 +291,10 @@ ENDUSAGE
           options['max-keys'] = '200' # use manageable chunks
           options['marker'] = marker unless marker == ''
           d = S3sync.S3try(:list_bucket, bucket, options)
-          $stderr.puts "S3 ERROR: #{d.http_response}" unless d.http_response.is_a? Net::HTTPSuccess
+          unless d.http_response.is_a? Net::HTTPSuccess
+            $stderr.puts "S3 ERROR: #{d.http_response}"
+            exit(false)
+          end
           # the 'directories' and leaf nodes are in two separate collections
           # because a dir will never have the same name as a node, we can just shove them together and sort
           # it's important to evaluate them alphabetically for efficient comparison to the local tree
@@ -381,15 +384,15 @@ ENDUSAGE
           else
             LocalNode.new(localPrefix, sourceNode.name)
           end
-        puts "Create node #{sourceNode.name}" if $S3syncOptions['--verbose']
+        puts "Create #{sourceNode.directory? ? 'folder' : 'node'} #{sourceNode.name}" if $S3syncOptions['--verbose']
         dNode.updateFrom(sourceNode) unless $S3syncOptions['--dryrun']
         sourceNode = sourceNode.nil? ? nil : sourceTree.next rescue nil
       elsif (!sourceNode) or (destinationNode and (sourceNode.name > destinationNode.name))
-        $stderr.puts "Source does not have #{destinationNode.name}" if $S3syncOptions['--debug']
+        $stderr.puts "Source does not have #{destinationNode.name.empty? ? destinationNode.path : destinationNode.name}" if $S3syncOptions['--debug']
         if $S3syncOptions['--delete']
           if destinationNode.directory?
             # have to wait
-            nodesToDelete.push(destinationNode) 
+            nodesToDelete.push(destinationNode) unless destinationNode.name.empty?
           else
             puts "Remove node #{destinationNode.name}" if $S3syncOptions['--verbose']
             destinationNode.delete unless $S3syncOptions['--dryrun']
@@ -410,7 +413,7 @@ ENDUSAGE
 
     # get rid of the (now empty, except for other directories) directories
     nodesToDelete.reverse_each do |node|
-      puts "Remove node #{node.name}" if $S3syncOptions['--verbose']
+      puts "Remove folder #{node.name}" if $S3syncOptions['--verbose']
       node.delete unless $S3syncOptions['--dryrun']
     end
   end #main
@@ -422,6 +425,7 @@ ENDUSAGE
     attr_reader :size
     attr_reader :tag
     attr_reader :date
+    attr_reader :path
     def initialize(name='', size = 0, tag = '', date = Time.now.utc)
       @name = name
       @size = size
@@ -429,7 +433,7 @@ ENDUSAGE
       @date = date
     end
     def directory?()
-      @tag == $S3syncDirTag and @size == $S3syncDirString.length
+      @folder
     end
   end
 
@@ -438,6 +442,7 @@ ENDUSAGE
     @path = nil
     @bucket = nil
     @result = nil
+    @folder = false
     def initialize(bucket, prefix, itemOrName)
       @bucket = bucket
       if itemOrName.kind_of? String
@@ -453,6 +458,7 @@ ENDUSAGE
         @path = prefix + slash + itemOrName
       else
         @name = (itemOrName.name.slice((prefix.length)..itemOrName.name.length) or '')
+        @folder = true if @name =~ %r{/$}
         # depending whether the prefix is / tailed, the name might need trimming
         @name.sub!(%r{^/},"") # get rid of leading slash in name if there (from above simplistic split)
         @name.sub!(%r{/$}, "") # don't create directories with a slash on the end
@@ -520,6 +526,7 @@ ENDUSAGE
             debug("Mime type: #{mType}")
             headers['Content-Type'] = mType
           end
+          @path = "#{@path}/" if fromNode.directory?
           @result = S3sync.S3try(:put, @bucket, @path, s3o, headers)
           theStream.close if (theStream and not theStream.closed?)
         rescue NoMethodError
@@ -535,6 +542,7 @@ ENDUSAGE
       end
     end
     def delete
+      @path = "#{@path}/" if @folder
       @result = S3sync.S3try(:delete, @bucket, @path)
     end
   end
@@ -548,6 +556,7 @@ ENDUSAGE
       @path = prefix + slash + partialPath
       # slash isn't at the front of this any more @name = (partialPath.slice(1..partialPath.length) or '')
       @name = partialPath or ''
+      @folder = false
       if FileTest.symlink?(@path)
         # this could use the 'file' case below, but why create an extra temp file
         linkData = File.readlink(@path)
@@ -578,6 +587,7 @@ ENDUSAGE
           @tag = nil
         end
       elsif FileTest.directory?(@path)
+        @folder = true
         # all s3 directories are dummy nodes contain the same directory string
         # so for easy comparison, set our size and tag thusly
         @size = $S3syncDirString.length
